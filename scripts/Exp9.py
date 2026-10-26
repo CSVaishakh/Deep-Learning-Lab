@@ -1,220 +1,118 @@
 import os
-import re
-from collections import Counter
-
+import random
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
 from sklearn.model_selection import train_test_split
+from tensorflow.keras.layers import Input, LSTM, Embedding, Dense
+from tensorflow.keras.models import Model
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
-print("TensorFlow:", tf.__version__)
-print("GPU:", tf.config.list_physical_devices("GPU"))
-
-# On Colab, upload English2Hindi.csv when asked
-if not os.path.exists("English2Hindi.csv"):
-    from google.colab import files
-    files.upload()
-
-data = pd.read_csv("English2Hindi.csv").dropna(subset=["English", "Hindi"])
-print("Rows:", len(data))
+os.environ['PYTHONHASHSEED'] = '42'
+random.seed(42)
+np.random.seed(42)
+tf.random.set_seed(42)
 
 
-MAX_WORDS = 20      # keep sentences with at most this many words
-ENG_VOCAB = 15000   # keep the most frequent words; the rest become <unk>
-HIN_VOCAB = 15000
+data = pd.read_csv('English2Hindi.csv', encoding='utf-8').dropna(subset=['English', 'Hindi'])
+# Keep short sentence pairs (<= 10 words) and a 10k sample so padding and training stay manageable
+eng_len = data['English'].str.split().str.len()
+hin_len = data['Hindi'].str.split().str.len()
+data = data[(eng_len <= 10) & (hin_len <= 10)].sample(n=10000, random_state=42).reset_index(drop=True)
 
-def clean(text):
-    text = str(text).lower().strip()
-    text = re.sub(r"([?.!,।|])", r" \1 ", text)  # split punctuation from words
-    return re.sub(r"\s+", " ", text).strip()
+X_data = data['English'].astype(str).str.lower().str.strip()
+y_data = data['Hindi'].astype(str).str.strip().apply(lambda x: 'startseq ' + x + ' endseq')
 
-data["English"] = data["English"].map(clean)
-data["Hindi"] = data["Hindi"].map(clean)
+eng_tokenizer = Tokenizer(filters='!"#$%&()*+,-./:;<=>?@[\\]^_`{|}~\t\n')
+eng_tokenizer.fit_on_texts(X_data)
+num_enc_toks = len(eng_tokenizer.word_index) + 1
+hin_tokenizer = Tokenizer(filters='!"#$%&()*+,-./:;<=>?@[\\]^_`{|}~\t\n')
+hin_tokenizer.fit_on_texts(y_data)
+num_dec_toks = len(hin_tokenizer.word_index) + 1
+enc_input_sequences = eng_tokenizer.texts_to_sequences(X_data)
+dec_sequences = hin_tokenizer.texts_to_sequences(y_data)
 
-data = data[
-    data["English"].str.split().str.len().between(1, MAX_WORDS) &
-    data["Hindi"].str.split().str.len().between(1, MAX_WORDS)
-].drop_duplicates(subset=["English"]).reset_index(drop=True)
+max_len_src = max(len(seq) for seq in enc_input_sequences)
+max_len_tar = max(len(seq) for seq in dec_sequences)
 
-print("Sentence pairs used:", len(data))
-data[["English", "Hindi"]].head()
+encoder_input_data = pad_sequences(enc_input_sequences, maxlen=max_len_src, padding='post')
+padded_dec_sequences = pad_sequences(dec_sequences, maxlen=max_len_tar, padding='post')
+decoder_input_data = padded_dec_sequences[:, :-1]
+decoder_output_data = padded_dec_sequences[:, 1:]
 
-
-# Special tokens: 0 = padding, 1 = unknown word, 2 = start, 3 = end
-PAD, UNK, START, END = "<pad>", "<unk>", "<start>", "<end>"
-
-X_train, X_test, y_train, y_test = train_test_split(
-    data["English"], data["Hindi"], test_size=0.1, random_state=42
+max_len_tar = max_len_tar - 1
+(encoder_input_train, encoder_input_test,
+ decoder_input_train, decoder_input_test,
+ decoder_output_train, decoder_output_test,
+ X_train, X_test,
+ y_train, y_test) = train_test_split(
+    encoder_input_data, decoder_input_data, decoder_output_data, X_data, data['Hindi'],
+    test_size=0.2, random_state=42
 )
 
-def build_vocab(sentences, size):
-    counts = Counter(w for s in sentences for w in s.split())
-    words = [PAD, UNK, START, END] + [w for w, _ in counts.most_common(size - 4)]
-    return {w: i for i, w in enumerate(words)}
 
-eng_to_id = build_vocab(X_train, ENG_VOCAB)
-hin_to_id = build_vocab(y_train, HIN_VOCAB)
-id_to_hin = {i: w for w, i in hin_to_id.items()}
+latent_dim = 250
+enc_inps = Input(shape=(max_len_src,))
+enc_emb = Embedding(num_enc_toks, latent_dim, mask_zero=True)(enc_inps)
+enc_outputs, st_h, st_c = LSTM(latent_dim, return_state=True)(enc_emb)
+enc_states = [st_h, st_c]
 
-max_eng_len = MAX_WORDS
-max_hin_len = MAX_WORDS + 1  # room for <start> / <end>
+dec_inps = Input(shape=(max_len_tar,))
+dec_emb = Embedding(num_dec_toks, latent_dim, mask_zero=True)(dec_inps)
+dec_lstm = LSTM(latent_dim, return_sequences=True, return_state=True)
+dec_outputs, _, _ = dec_lstm(dec_emb, initial_state=enc_states)
+dec_dense = Dense(num_dec_toks, activation='softmax')
+dec_outputs = dec_dense(dec_outputs)
 
-def encode(sentence, vocab):
-    return [vocab.get(w, vocab[UNK]) for w in sentence.split()]
-
-def make_arrays(X, y):
-    enc = [encode(s, eng_to_id) for s in X]
-    hin = [encode(s, hin_to_id) for s in y]
-    # Teacher forcing: decoder reads "<start> w1 w2 ..." and predicts "w1 w2 ... <end>"
-    dec_in = [[hin_to_id[START]] + h for h in hin]
-    dec_out = [h + [hin_to_id[END]] for h in hin]
-    pad = lambda seqs, n: keras.utils.pad_sequences(seqs, maxlen=n, padding="post")
-    return pad(enc, max_eng_len), pad(dec_in, max_hin_len), pad(dec_out, max_hin_len)
-
-Xtr, Ytr_in, Ytr_out = make_arrays(X_train, y_train)
-Xte, Yte_in, Yte_out = make_arrays(X_test, y_test)
-
-print("English vocab:", len(eng_to_id), "| Hindi vocab:", len(hin_to_id))
-print("Train:", Xtr.shape, "| Test:", Xte.shape)
+model = Model([enc_inps, dec_inps], dec_outputs)
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
 
 
-# Encoder-decoder LSTM with attention
-EMB_DIM = 256
-UNITS = 512
-
-# Encoder
-enc_input = keras.Input(shape=(None,), name="english")
-enc_emb = layers.Embedding(len(eng_to_id), EMB_DIM, mask_zero=True)(enc_input)
-enc_outputs, enc_h, enc_c = layers.LSTM(
-    UNITS, return_sequences=True, return_state=True
-)(enc_emb)
-
-# Decoder (layers kept as variables so the inference model can reuse them)
-dec_input = keras.Input(shape=(None,), name="hindi_in")
-dec_emb_layer = layers.Embedding(len(hin_to_id), EMB_DIM, mask_zero=True)
-dec_lstm = layers.LSTM(UNITS, return_sequences=True, return_state=True)
-attention = layers.Attention()
-concat = layers.Concatenate()
-dec_hidden = layers.Dense(UNITS, activation="tanh")
-dec_dense = layers.Dense(len(hin_to_id), activation="softmax")
-
-dec_seq, _, _ = dec_lstm(dec_emb_layer(dec_input), initial_state=[enc_h, enc_c])
-context = attention([dec_seq, enc_outputs])  # which English words to look at
-dec_output = dec_dense(dec_hidden(concat([dec_seq, context])))
-
-model = keras.Model([enc_input, dec_input], dec_output)
-
-# Per-word accuracy. Keras skips padded positions automatically because
-# the decoder embedding uses mask_zero=True (same for the loss).
-def word_accuracy(y_true, y_pred):
-    y_true = tf.cast(y_true, tf.int64)
-    return tf.cast(tf.equal(y_true, tf.argmax(y_pred, axis=-1)), tf.float32)
-
-model.compile(
-    optimizer=keras.optimizers.Adam(1e-3),
-    loss="sparse_categorical_crossentropy",
-    metrics=[word_accuracy]
-)
-model.summary()
-
-
-early_stop = keras.callbacks.EarlyStopping(
-    monitor="val_loss", patience=3, restore_best_weights=True
+print("Training model...")
+model.fit(
+    [encoder_input_train, decoder_input_train],
+    decoder_output_train,
+    batch_size=16,
+    epochs=50,
+    validation_data=([encoder_input_test, decoder_input_test], decoder_output_test)
 )
 
-history = model.fit(
-    [Xtr, Ytr_in], Ytr_out,
-    validation_data=([Xte, Yte_in], Yte_out),
-    batch_size=128,
-    epochs=30,           # maximum; EarlyStopping usually stops sooner
-    callbacks=[early_stop],
-    verbose=2            # one line per epoch
-)
 
-fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-ax[0].plot(history.history["loss"], label="train")
-ax[0].plot(history.history["val_loss"], label="validation")
-ax[0].set_title("Loss"); ax[0].set_xlabel("Epoch"); ax[0].legend()
-ax[1].plot(history.history["word_accuracy"], label="train")
-ax[1].plot(history.history["val_word_accuracy"], label="validation")
-ax[1].set_title("Word accuracy"); ax[1].set_xlabel("Epoch"); ax[1].legend()
-plt.show()
+enc_model = Model(enc_inps, enc_states)
+dec_st_inp_h = Input(shape=(latent_dim,))
+dec_st_inp_c = Input(shape=(latent_dim,))
+dec_states_inps = [dec_st_inp_h, dec_st_inp_c]
+dec_emb2 = model.layers[3](dec_inps)
+dec_outputs2, st_h2, st_c2 = model.layers[5](dec_emb2, initial_state=dec_states_inps)
+dec_outputs2 = model.layers[6](dec_outputs2)
+dec_model = Model([dec_inps] + dec_states_inps, [dec_outputs2] + [st_h2, st_c2])
+rev_tar_char_idx = {i: word for word, i in hin_tokenizer.word_index.items()}
 
 
-# Inference models: run the encoder once, then the decoder one word at a time
-encoder_model = keras.Model(enc_input, [enc_outputs, enc_h, enc_c])
+def translate(input_text):
+    seq = eng_tokenizer.texts_to_sequences([input_text])
+    padded_seq = pad_sequences(seq, maxlen=max_len_src, padding='post')
+    states_value = enc_model.predict(padded_seq, verbose=0)
+    tar_seq = np.zeros((1, max_len_tar))
+    tar_seq[0, 0] = hin_tokenizer.word_index['startseq']
+    dec_sen = []
+    for t in range(max_len_tar - 1):
+        output_toks, h, c = dec_model.predict([tar_seq] + states_value, verbose=0)
+        sampled_tok_idx = np.argmax(output_toks[0, t, :])
+        if sampled_tok_idx == 0:
+            break
+        sampled_char = rev_tar_char_idx.get(sampled_tok_idx, '')
+        if sampled_char == 'endseq':
+            break
+        dec_sen.append(sampled_char)
+        tar_seq[0, t + 1] = sampled_tok_idx
+    return ' '.join(dec_sen)
 
-step_input = keras.Input(shape=(1,))
-enc_out_input = keras.Input(shape=(None, UNITS))
-enc_mask_input = keras.Input(shape=(None,), dtype="bool")
-h_input = keras.Input(shape=(UNITS,))
-c_input = keras.Input(shape=(UNITS,))
-
-step_seq, step_h, step_c = dec_lstm(
-    dec_emb_layer(step_input), initial_state=[h_input, c_input]
-)
-step_context = attention([step_seq, enc_out_input], mask=[None, enc_mask_input])
-step_probs = dec_dense(dec_hidden(concat([step_seq, step_context])))
-
-decoder_model = keras.Model(
-    [step_input, enc_out_input, enc_mask_input, h_input, c_input],
-    [step_probs, step_h, step_c]
-)
-
-def translate_batch(sentences, batch_size=256):
-    results = []
-    for b in range(0, len(sentences), batch_size):
-        chunk = sentences[b:b + batch_size]
-        enc = keras.utils.pad_sequences(
-            [encode(clean(s), eng_to_id)[:max_eng_len] for s in chunk],
-            maxlen=max_eng_len, padding="post"
-        )
-        enc_out, h, c = encoder_model(enc, training=False)
-        enc_mask = tf.constant(enc != 0)
-        token = np.full((len(chunk), 1), hin_to_id[START])
-        predicted = []
-        for _ in range(max_hin_len):
-            probs, h, c = decoder_model(
-                [tf.constant(token), enc_out, enc_mask, h, c], training=False
-            )
-            token = np.argmax(np.asarray(probs)[:, -1, :], axis=-1)[:, None]
-            predicted.append(token[:, 0])
-        for row in np.stack(predicted, axis=1):
-            words = []
-            for t in row:
-                if t == hin_to_id[END]:
-                    break
-                words.append(id_to_hin.get(int(t), UNK))
-            results.append(" ".join(words))
-    return results
-
-def translate(sentence):
-    return translate_batch([sentence])[0]
-
-k = 0
-print(f'''Input English sentence: {X_train.iloc[k]}\n
-          Predicted Hindi Translation: {translate(X_train.iloc[k])}\n
-          Actual Hindi Translation: {y_train.iloc[k]}''')
-
-
-# Translations of sentences the model has never seen
-samples = X_test.iloc[:10].tolist()
-for eng, pred, actual in zip(samples, translate_batch(samples), y_test.iloc[:10]):
-    print("English  :", eng)
-    print("Predicted:", pred)
-    print("Actual   :", actual)
-    print()
-
-
-# BLEU score on 1000 test sentences (0-100, higher is better)
-from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
-
-n = 1000
-predictions = translate_batch(X_test.iloc[:n].tolist())
-references = [[ref.split()] for ref in y_test.iloc[:n]]
-hypotheses = [p.split() for p in predictions]
-bleu = corpus_bleu(references, hypotheses, smoothing_function=SmoothingFunction().method1)
-print(f"BLEU score: {bleu * 100:.2f}")
+print("\n--- Translation Test (3 Sampled Unseen Test Sentences) ---")
+sample_indices = X_test.sample(n=3, random_state=42).index
+for i in sample_indices:
+    test_phrase = X_test.loc[i]
+    print(f"English Input: {test_phrase}")
+    print(f"Predicted Hindi: {translate(test_phrase)}")
+    print(f"Actual Expected Hindi: {y_test.loc[i]}")
