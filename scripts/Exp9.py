@@ -108,7 +108,6 @@ def translate(input_text):
 
         dec_sen.append(sampled_char)
         tar_seq[0, t + 1] = sampled_tok_idx
-        states_value = [h, c]
 
     return ' '.join(dec_sen)
 

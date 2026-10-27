@@ -7,6 +7,7 @@ from tensorflow.keras.datasets import imdb
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Embedding, SimpleRNN, LSTM, GRU, Dense
+from tensorflow.keras.callbacks import EarlyStopping
 
 # 1. Load IMDB Dataset
 vocab_size = 10000
@@ -69,6 +70,7 @@ for architecture in architectures:
         epochs=6,
         batch_size=64,
         validation_split=0.2,
+        callbacks=[EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True)],
         verbose=1
     )
 
