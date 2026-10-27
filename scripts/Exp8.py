@@ -1,9 +1,4 @@
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # no usable GPU under WSL; run on CPU
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # hide TF info/warning logs
-
 import numpy as np
-import tensorflow as tf
 from tensorflow.keras.datasets import imdb
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.models import Sequential
